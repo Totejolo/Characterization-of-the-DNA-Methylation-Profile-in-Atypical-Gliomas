@@ -1,0 +1,124 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
+
+# --- Carga de datos ---
+archivo = "GSE50923_non-normalized.txt"
+df = pd.read_csv(archivo, sep="\t", low_memory=False)
+
+print(f"Dimensiones del dataset: {df.shape}")
+print("\nNombres de columnas:")
+print(df.columns.tolist())
+print("\nPrimeras 5 filas:")
+print(df.head())
+print("\nDatos faltantes por columna:")
+print(df.isnull().sum())
+
+# --- Filtrado por calidad usando Detection.Pval ---
+cols_pval = [col for col in df.columns if '.Detection.Pval' in col]
+mask = (df[cols_pval] < 0.01).all(axis=1)
+df_filtrado = df.loc[mask].reset_index(drop=True)
+print(f"Probes después de filtro por p-value: {df_filtrado.shape[0]}")
+
+# --- Cálculo beta-values ---
+sample_names = set([col.split('.')[0] for col in df.columns if '.Methylated' in col])
+beta_df = pd.DataFrame({'ID_REF': df_filtrado['ID_REF']})
+
+for sample in sample_names:
+    meth_col = f"{sample}.Methylated"
+    unmeth_col = f"{sample}.Unmethylated"
+    if meth_col in df_filtrado.columns and unmeth_col in df_filtrado.columns:
+        beta_df[sample] = df_filtrado[meth_col] / (df_filtrado[meth_col] + df_filtrado[unmeth_col] + 100)
+
+print("Primeras filas del DataFrame con beta-values:")
+print(beta_df.head())
+
+# --- Guardar beta-values filtrados ---
+beta_df.to_csv("beta_values_filtrados.csv", index=False)
+
+# --- Visualización: Histograma global de beta-values ---
+plt.figure(figsize=(8,6))
+sns.histplot(beta_df.drop('ID_REF', axis=1).values.flatten(), bins=100, kde=True)
+plt.title("Distribución global de beta-values")
+plt.xlabel("Beta-value")
+plt.ylabel("Frecuencia")
+plt.show()
+
+# --- PCA para visualización de agrupamientos ---
+X = beta_df.drop('ID_REF', axis=1).T
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca = PCA(n_components=2)
+pc = pca.fit_transform(X_scaled)
+
+plt.figure(figsize=(8,6))
+plt.scatter(pc[:,0], pc[:,1])
+plt.title("PCA de muestras basado en beta-values")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.show()
+
+# --- Definir grupos para análisis diferencial ---
+grupo = {
+    'X8280': 'control',
+    'X8282': 'control',
+    'X8294': 'caso',
+    'X8298': 'caso',
+    # Añade todos los demás aquí...
+}
+
+control_cols = [col for col in beta_df.columns if grupo.get(col) == 'control']
+caso_cols = [col for col in beta_df.columns if grupo.get(col) == 'caso']
+
+# --- Test t para cada probe ---
+pvals = [sm.stats.ttest_ind(row[control_cols].values, row[caso_cols].values)[1] for _, row in beta_df.iterrows()]
+
+# --- Corrección por múltiples pruebas (FDR) ---
+reject, pvals_corr, _, _ = multipletests(pvals, method='fdr_bh')
+
+# --- Agregar resultados al dataframe ---
+beta_df['pval'] = pvals
+beta_df['pval_adj'] = pvals_corr
+beta_df['significativo'] = reject
+
+print(f"{beta_df['significativo'].sum()} probes diferencialmente metilados con FDR<0.05")
+
+# --- Calcular log2 Fold Change ---
+beta_df['log2FC'] = beta_df.apply(lambda row: np.log2(
+    (row[caso_cols].mean() + 1e-6) / (row[control_cols].mean() + 1e-6)), axis=1)
+
+# --- Volcano plot ---
+plt.figure(figsize=(10,6))
+sns.scatterplot(x='log2FC', y=-np.log10(beta_df['pval_adj']), hue='significativo', data=beta_df,
+                palette={True:'red', False:'gray'}, legend=False)
+plt.axhline(-np.log10(0.05), ls='--', color='blue')
+plt.title("Volcano plot - análisis diferencial de metilación")
+plt.xlabel("log2 Fold Change")
+plt.ylabel("-log10(p-value ajustado)")
+plt.show()
+
+# --- Heatmap de probes diferencialmente metilados o top 100 por p-valor bruto ---
+df_sig = beta_df[beta_df['significativo']].set_index('ID_REF')
+
+if not df_sig.empty:
+    data_heatmap = df_sig[control_cols + caso_cols]
+    titulo = "Heatmap de probes diferencialmente metilados (FDR < 0.05)"
+else:
+    print("No se encontraron probes significativos con FDR < 0.05. Usando los 100 probes con menor p-valor no ajustado.")
+    top100 = beta_df.nsmallest(100, 'pval').set_index('ID_REF')
+    data_heatmap = top100[control_cols + caso_cols]
+    titulo = "Heatmap de los 100 probes con menor p-valor bruto"
+
+sns.clustermap(data_heatmap, cmap="viridis", standard_scale=1, col_cluster=True, row_cluster=True)
+plt.title(titulo)
+plt.show()
+
+# --- Guardar resultados ---
+beta_df.to_csv("resultados_analisis_metilacion.csv", index=False)
+print(f"{beta_df['significativo'].sum()} probes diferencialmente metilados con FDR<0.05")
